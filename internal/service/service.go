@@ -39,8 +39,7 @@ func Run(port, origin string) error {
 		rKey := prepareCacheKey(r)
 		wg.RLock()
 		if cachedResp, ok := cache[rKey]; ok {
-			w.Header().Set("X-Cache", "HIT")
-			sendResp(w, cachedResp)
+			sendCachedResponse(w, cachedResp)
 			wg.RUnlock()
 			log.Printf("response took from cache. Elapsed in %dms\n", time.Since(t).Milliseconds())
 			return
@@ -58,14 +57,7 @@ func Run(port, origin string) error {
 		defer resp.Body.Close()
 
 		// Send response
-		for key, values := range resp.Header {
-			for _, value := range values {
-				w.Header().Add(key, value)
-			}
-		}
-		w.Header().Set("X-Cache", "MISS")
-		w.WriteHeader(resp.StatusCode)
-		io.Copy(w, resp.Body)
+		sendResp(w, resp)
 
 		// Cache response
 		wg.Lock()
@@ -82,7 +74,7 @@ func Run(port, origin string) error {
 }
 
 // sendResp sends a response to the client, copying the headers and body
-func sendResp(w http.ResponseWriter, ci *cacheItem) {
+func sendCachedResponse(w http.ResponseWriter, ci *cacheItem) {
 	w.WriteHeader(ci.StatusCode)
 
 	for key, values := range ci.Header {
@@ -91,9 +83,13 @@ func sendResp(w http.ResponseWriter, ci *cacheItem) {
 		}
 	}
 
+	w.Header().Set("X-Cache", "HIT")
+
 	if _, err := w.Write(ci.Body); err != nil {
 		log.Fatalf("error while writing response body: %v", err)
 	}
+
+	return
 }
 
 // prepareCacheKey creates a unique cache key for the request
@@ -148,4 +144,26 @@ func newCacheResp(r *http.Response) *cacheItem {
 	ci.Body = body
 
 	return ci
+}
+
+func sendResp(w http.ResponseWriter, r *http.Response) {
+	w.WriteHeader(r.StatusCode)
+
+	for key, valuse := range r.Header {
+		for _, value := range valuse {
+			w.Header().Add(key, value)
+		}
+	}
+	w.Header().Add("X-Cache", "MISS")
+
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	w.Write(body)
+
+	return
 }
