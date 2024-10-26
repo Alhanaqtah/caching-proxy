@@ -3,7 +3,10 @@ package app
 import (
 	"context"
 	"fmt"
+	"log"
 	"net/url"
+	"strconv"
+	"time"
 
 	"github.com/Alhanaqtah/caching-proxy/internal/service"
 
@@ -25,12 +28,23 @@ func Run(ctx context.Context, args []string) error {
 			Action: func(c *cli.Context) error {
 				port := c.String("port")
 				origin := c.String("origin")
+				ttlStr := c.String("ttl")
+
+				if _, err := strconv.Atoi(port); err != nil {
+					log.Fatalf("invalid value for flag port: %v", err)
+				}
 
 				if _, err := url.ParseRequestURI(origin); err != nil {
 					return fmt.Errorf("invalid origin URL: %v", err)
 				}
 
-				return service.Run(port, origin)
+				ttl, err := strconv.Atoi(ttlStr)
+				if err != nil {
+					return fmt.Errorf("invalid value for flag ttl: %v", err)
+				}
+				ttlDuration := time.Duration(ttl) * time.Second
+
+				return service.Run(port, origin, ttlDuration)
 			},
 			Flags: []cli.Flag{
 				&cli.StringFlag{
@@ -45,15 +59,12 @@ func Run(ctx context.Context, args []string) error {
 					Required: true,
 					Usage:    "Origin server to cache responses from",
 				},
-			},
-		},
-		{
-			Name:        "clear",
-			Aliases:     []string{"c"},
-			Usage:       "Removes all cached responses",
-			Description: "Removes all cached responses",
-			Action: func(c *cli.Context) error {
-				return nil
+				&cli.StringFlag{
+					Name:     "ttl",
+					Aliases:  []string{"t"},
+					Required: true,
+					Usage:    "Cache items ttl in seconds",
+				},
 			},
 		},
 	}

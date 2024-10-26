@@ -21,116 +21,122 @@ type cacheItem struct {
 	StatusCode int
 	Header     http.Header
 	Body       []byte
+	Timestamp  time.Time
 }
 
-func Run(port, origin string) error {
+// Run starts the caching proxy server on the specified port, forwarding requests to the origin server and caching responses
+func Run(port, origin string, ttl time.Duration) error {
+	go cleanCacheWorker(ttl)
+
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		// Validation
+		// Validate request method
 		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusBadRequest)
-			w.Write([]byte("Method " + r.Method + " not allowed\n"))
-			log.Println("unsupported method.")
+			http.Error(w, "Method "+r.Method+" not allowed\n", http.StatusBadRequest)
+			log.Println("Unsupported method.")
 			return
 		}
 
 		t := time.Now()
 
-		// Search in cache
-		rKey := prepareCacheKey(r)
+		// Search for response in cache
+		rKey, err := prepareCacheKey(r)
+		if err != nil {
+			http.Error(w, "Error preparing cache key: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		wg.RLock()
 		if cachedResp, ok := cache[rKey]; ok {
 			sendCachedResponse(w, cachedResp)
 			wg.RUnlock()
-			log.Printf("response took from cache. Elapsed in %dms\n", time.Since(t).Milliseconds())
+
+			log.Printf("Response served from cache. Elapsed in %dms\n", time.Since(t).Milliseconds())
 			return
 		}
 		wg.RUnlock()
 
-		// Sending request to origin
-		log.Printf("sending request to: %s", origin+r.URL.Path)
-
+		// Forward request to origin server
+		log.Printf("Sending request to: %s", origin+r.URL.Path)
 		resp, err := http.Get(origin + r.URL.Path)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			http.Error(w, "Error contacting origin server: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		defer resp.Body.Close()
 
-		// Send response
+		// Send response to client and cache it
 		sendResp(w, resp)
 
-		// Cache response
+		ci, err := newCacheResp(resp)
+		if err != nil {
+			http.Error(w, "Error caching response: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+
 		wg.Lock()
-		cache[rKey] = newCacheResp(resp)
+		cache[rKey] = ci
 		wg.Unlock()
-		log.Printf("response cached. Elapsed in %dms\n", time.Since(t).Milliseconds())
+		log.Printf("Response cached. Elapsed in %dms\n", time.Since(t).Milliseconds())
 	})
 
 	if err := http.ListenAndServe(":"+port, nil); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		log.Printf("Error starting server: %v", err)
+		return err
 	}
 
 	return nil
 }
 
-// sendResp sends a response to the client, copying the headers and body
+// sendCachedResponse writes the cached response to the client
 func sendCachedResponse(w http.ResponseWriter, ci *cacheItem) {
 	w.WriteHeader(ci.StatusCode)
-
 	for key, values := range ci.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
-
 	w.Header().Set("X-Cache", "HIT")
 
 	if _, err := w.Write(ci.Body); err != nil {
-		log.Fatalf("error while writing response body: %v", err)
+		log.Printf("Error while writing response body: %v", err)
 	}
-
-	return
 }
 
-// prepareCacheKey creates a unique cache key for the request
-func prepareCacheKey(r *http.Request) string {
+// prepareCacheKey creates a unique cache key based on the request URL and headers
+func prepareCacheKey(r *http.Request) (string, error) {
 	var keyBuilder strings.Builder
 
 	keyBuilder.WriteString(r.URL.Path)
-
 	for key, values := range r.Header {
-		_, err := keyBuilder.WriteString(key)
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		_, err = keyBuilder.WriteString(strings.Join(values, ""))
-		if err != nil {
-			log.Fatal(err)
-		}
+		keyBuilder.WriteString(key)
+		keyBuilder.WriteString(strings.Join(values, ""))
 	}
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Fatalf("error reading request body: %v", err)
+		log.Printf("Error reading request body: %v", err)
+		return "", err
 	}
-	keyBuilder.Write(body)
+	defer r.Body.Close()
 
+	keyBuilder.Write(body)
 	r.Body = io.NopCloser(bytes.NewReader(body))
 
 	hash := sha256.New()
 	hash.Write([]byte(keyBuilder.String()))
-	return hex.EncodeToString(hash.Sum(nil))
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
-func newCacheResp(r *http.Response) *cacheItem {
+// newCacheResp creates a cache item from the response and returns it
+func newCacheResp(r *http.Response) (*cacheItem, error) {
 	ci := &cacheItem{
 		StatusCode: r.StatusCode,
 		Header:     make(http.Header),
+		Timestamp:  time.Now(),
 	}
 
-	for key, valuse := range r.Header {
-		for _, value := range valuse {
+	for key, values := range r.Header {
+		for _, value := range values {
 			ci.Header.Add(key, value)
 		}
 	}
@@ -138,32 +144,46 @@ func newCacheResp(r *http.Response) *cacheItem {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error reading body: %v", err)
+		return nil, err
 	}
 
 	ci.Body = body
-
-	return ci
+	return ci, nil
 }
 
+// sendResp sends the response from the origin server to the client
 func sendResp(w http.ResponseWriter, r *http.Response) {
 	w.WriteHeader(r.StatusCode)
-
-	for key, valuse := range r.Header {
-		for _, value := range valuse {
+	for key, values := range r.Header {
+		for _, value := range values {
 			w.Header().Add(key, value)
 		}
 	}
-	w.Header().Add("X-Cache", "MISS")
+	w.Header().Set("X-Cache", "MISS")
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("Error reading response body: %v", err)
+		return
 	}
 
 	r.Body = io.NopCloser(bytes.NewReader(body))
-
 	w.Write(body)
+}
 
-	return
+// cleanCacheWorker periodically removes expired items from the cache based on the specified TTL
+func cleanCacheWorker(ttl time.Duration) {
+	ticker := time.NewTicker(ttl)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		wg.Lock()
+		for key, item := range cache {
+			if time.Since(item.Timestamp) > ttl {
+				delete(cache, key)
+			}
+		}
+		wg.Unlock()
+	}
 }
